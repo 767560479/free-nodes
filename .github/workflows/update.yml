@@ -13,16 +13,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  scrape:
+  build-and-update:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [0, 1, 2, 3]
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,44 +32,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run Scraper Script
-        run: python scraper.py --group ${{ matrix.group }} --groups 4
-
-      - name: Upload Subscription
-        uses: actions/upload-artifact@v4
-        with:
-          name: sub-${{ matrix.group }}
-          path: output/sub-${{ matrix.group }}.txt
-          retention-days: 1
-
-  merge:
-    needs: scrape
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          ref: master
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download All Subscriptions
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Merge and Write Output
-        run: |
-          mkdir -p output
-          for i in 0 1 2 3; do
-            cp "artifacts/sub-$i/sub-$i.txt" "output/sub-$i.txt"
-          done
-          python scraper.py --merge --groups 4
+        run: python scraper.py
 
       - name: Commit and Push Changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/sub*.txt
+          git add output/nodes.txt
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else

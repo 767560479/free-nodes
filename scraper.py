@@ -5,7 +5,6 @@ import json
 import random
 import socket
 import time
-import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import quote
@@ -14,7 +13,6 @@ from urllib.parse import quote
 
 CUSTOM_REMARK_B64 = "56eR5oqA5YWx5LqrLeW8gOa6kOiKgueCuQ=="
 
-# 2. 节点订阅源库（随时可在末尾追加新链接）
 SOURCE_URLS = [
     "https://cdn.jsdelivr.net/gh/Pawdroid/Free-servers@main/sub",
     "https://cdn.jsdelivr.net/gh/mfuu/v2ray@master/v2ray",
@@ -35,23 +33,18 @@ SOURCE_URLS = [
     "https://raw.githubusercontent.com/hello-world-1989/cn-news/main/end-gfw-together",
 ]
 
-# 3. 垃圾节点过滤黑名单
 BLACKLIST_KEYWORDS = ['-1', '127.0.0.1', 'timeout', 'err', '错误', '剩余', '到期', '官网', 'mibei77', '别买']
 
-# 4. 请求节奏（秒）
 REQUEST_DELAY = (1.0, 2.0)
 RETRY_DELAY = (3.0, 8.0)
 MAX_RETRIES = 2
 REQUEST_TIMEOUT = 20
 
-# 5. 节点筛选
-MAX_NODES = 1000
-MAX_NODES_PER_GROUP = 300
+TARGET_NODES = 200
 ENABLE_TCP_CHECK = True
 TCP_TIMEOUT = 3
 TCP_WORKERS = 128
-MAX_LATENCY_MS = 2000   # TCP 握手超过此毫秒数则不写入
-DEFAULT_GROUPS = 4
+MAX_LATENCY_MS = 2000
 
 # ====================================================
 
@@ -211,25 +204,35 @@ def tcp_connect_latency_ms(host, port):
         return None
 
 
-def filter_alive_nodes(nodes):
-    if not ENABLE_TCP_CHECK or not nodes:
-        return nodes
+def filter_alive_nodes(nodes, limit):
+    if not nodes or limit <= 0:
+        return []
+
+    if not ENABLE_TCP_CHECK:
+        return nodes[:limit]
 
     alive = []
-    with ThreadPoolExecutor(max_workers=TCP_WORKERS) as executor:
-        futures = {}
-        for node in nodes:
-            fp = node_fingerprint(node)
-            if not fp:
-                continue
-            host, port, _ = fp
-            futures[executor.submit(tcp_connect_latency_ms, host, port)] = node
+    executor = ThreadPoolExecutor(max_workers=TCP_WORKERS)
+    try:
+        futures = {
+            executor.submit(tcp_connect_latency_ms, fp[0], fp[1]): node
+            for node in nodes
+            if (fp := node_fingerprint(node))
+        }
 
         for future in as_completed(futures):
-            latency_ms = future.result()
+            if len(alive) >= limit:
+                break
+            try:
+                latency_ms = future.result()
+            except Exception:
+                continue
             if latency_ms is not None and latency_ms <= MAX_LATENCY_MS:
                 alive.append(futures[future])
-    return alive
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return alive[:limit]
 
 
 def fetch_and_decode(url, session):
@@ -270,7 +273,7 @@ def rename_node(link, index):
         except Exception:
             return link
 
-    elif any(link.startswith(p) for p in ['vless://', 'trojan://', 'ss://', 'ssr://', 'tuic://', 'hysteria2://']):
+    if any(link.startswith(p) for p in ['vless://', 'trojan://', 'ss://', 'ssr://', 'tuic://', 'hysteria2://']):
         try:
             base_link = link.split("#", 1)[0] if "#" in link else link
             return f"{base_link}#{quote(new_name)}"
@@ -280,18 +283,8 @@ def rename_node(link, index):
     return link
 
 
-def split_source_urls(group, groups):
-    if groups <= 1:
-        return SOURCE_URLS
-    chunk = (len(SOURCE_URLS) + groups - 1) // groups
-    start = group * chunk
-    return SOURCE_URLS[start:start + chunk]
-
-
-def dedup_nodes(lines):
-    valid_nodes = []
-    seen_lines = set()
-    seen_fingerprints = set()
+def dedup_lines(lines, seen_lines, seen_fingerprints):
+    new_nodes = []
     raw_count = 0
 
     for line in lines:
@@ -312,120 +305,74 @@ def dedup_nodes(lines):
         seen_lines.add(line)
         if fp:
             seen_fingerprints.add(fp)
-        valid_nodes.append(line)
+        new_nodes.append(line)
 
-    return raw_count, valid_nodes
+    return raw_count, new_nodes
 
 
-def write_subscription(nodes, sub_path, nodes_path=None):
+def write_nodes_file(nodes):
     final_nodes = [rename_node(node, i) for i, node in enumerate(nodes, 1)]
     raw_text = "\n".join(final_nodes)
-    sub_base64 = base64.b64encode(raw_text.encode('utf-8')).decode('utf-8')
-
-    os.makedirs(os.path.dirname(sub_path) or 'output', exist_ok=True)
-    with open(sub_path, 'w', encoding='utf-8') as f:
-        f.write(sub_base64)
-    if nodes_path:
-        with open(nodes_path, 'w', encoding='utf-8') as f:
-            f.write(raw_text)
+    os.makedirs('output', exist_ok=True)
+    with open('output/nodes.txt', 'w', encoding='utf-8') as f:
+        f.write(raw_text)
     return len(final_nodes)
 
 
-def run_scrape(group, groups):
+def main():
     global _failed_sources
     _failed_sources = []
 
     started = time.time()
-    sources = split_source_urls(group, groups)
-    label = f"组 {group}/{groups - 1}" if groups > 1 else "全部"
-    max_nodes = MAX_NODES_PER_GROUP if groups > 1 else MAX_NODES
+    print(f"=== 节点抓取 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
-    print(f"=== 节点抓取 [{label}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
-
-    all_lines = []
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
 
-    for i, url in enumerate(sources):
+    seen_lines = set()
+    seen_fingerprints = set()
+    passed_nodes = []
+    total_raw = 0
+    sources_used = 0
+
+    for i, url in enumerate(SOURCE_URLS):
+        if len(passed_nodes) >= TARGET_NODES:
+            break
+
         if i > 0:
             _sleep(REQUEST_DELAY)
-        all_lines.extend(fetch_and_decode(url, session))
 
-    source_ok = len(sources) - len(_failed_sources)
-    print(f"抓取: {source_ok}/{len(sources)} 源成功, {len(all_lines)} 行原始数据")
+        lines = fetch_and_decode(url, session)
+        sources_used += 1
+        raw_count, candidates = dedup_lines(lines, seen_lines, seen_fingerprints)
+        total_raw += raw_count
 
-    raw_count, valid_nodes = dedup_nodes(all_lines)
-    print(f"去重: {raw_count} -> {len(valid_nodes)} 节点")
+        if not candidates:
+            continue
 
-    if len(valid_nodes) > max_nodes:
-        valid_nodes = valid_nodes[:max_nodes]
-        print(f"预限: 保留前 {max_nodes} 个待检测")
+        need = TARGET_NODES - len(passed_nodes)
+        passed = filter_alive_nodes(candidates, need)
+        passed_nodes.extend(passed)
 
-    if ENABLE_TCP_CHECK:
-        before_tcp = len(valid_nodes)
-        valid_nodes = filter_alive_nodes(valid_nodes)
-        print(f"TCP: {before_tcp} -> {len(valid_nodes)} 可达 (≤{MAX_LATENCY_MS}ms, {TCP_WORKERS} 线程)")
+        if len(passed_nodes) >= TARGET_NODES:
+            print(f"已达 {TARGET_NODES} 个可用节点，停止抓取与检测")
+            break
 
-    sub_path = f'output/sub-{group}.txt' if groups > 1 else 'output/sub.txt'
-    nodes_path = f'output/nodes-{group}.txt' if groups > 1 else 'output/nodes.txt'
-    count = write_subscription(valid_nodes, sub_path, nodes_path)
+    print(f"抓取: {sources_used}/{len(SOURCE_URLS)} 源, {total_raw} 行原始数据")
+    print(f"TCP: {len(passed_nodes)} 节点通过 (≤{MAX_LATENCY_MS}ms, {TCP_WORKERS} 线程)")
+
+    if not passed_nodes:
+        print("无可用节点，跳过写入")
+    else:
+        count = write_nodes_file(passed_nodes)
+        print(f"完成: 写入 output/nodes.txt ({count} 节点)")
 
     elapsed = int(time.time() - started)
-    print(f"完成: 输出 {count} 节点 -> {sub_path}, 耗时 {elapsed // 60}m{elapsed % 60:02d}s")
+    print(f"耗时 {elapsed // 60}m{elapsed % 60:02d}s")
 
     if _failed_sources:
         failed = ', '.join(f"{host}({err})" for host, err in _failed_sources)
         print(f"失败源 ({len(_failed_sources)}): {failed}")
-
-
-def merge_sub_files(groups):
-    started = time.time()
-    print(f"=== 合并订阅 {groups} 组 ===")
-
-    all_nodes = []
-    seen_fingerprints = set()
-
-    for i in range(groups):
-        path = f'output/sub-{i}.txt'
-        if not os.path.exists(path):
-            print(f"跳过: {path} 不存在")
-            continue
-        with open(path, encoding='utf-8') as f:
-            content = base64.b64decode(_pad_base64(f.read())).decode('utf-8')
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            fp = node_fingerprint(line)
-            if fp and fp in seen_fingerprints:
-                continue
-            if fp:
-                seen_fingerprints.add(fp)
-            base = line.split('#', 1)[0]
-            all_nodes.append(base)
-
-    print(f"合并去重: {len(all_nodes)} 节点")
-
-    if len(all_nodes) > MAX_NODES:
-        all_nodes = all_nodes[:MAX_NODES]
-        print(f"限量: 保留前 {MAX_NODES} 个")
-
-    count = write_subscription(all_nodes, 'output/sub.txt', 'output/nodes.txt')
-    elapsed = int(time.time() - started)
-    print(f"完成: sub.txt 共 {count} 节点, 耗时 {elapsed}s")
-
-
-def main():
-    parser = argparse.ArgumentParser(description='免费节点抓取与订阅生成')
-    parser.add_argument('--group', type=int, default=0, help='当前分组编号（从 0 开始）')
-    parser.add_argument('--groups', type=int, default=1, help='分组总数，1 表示不分组')
-    parser.add_argument('--merge', action='store_true', help='合并各组 sub-N.txt 为 sub.txt')
-    args = parser.parse_args()
-
-    if args.merge:
-        merge_sub_files(args.groups)
-    else:
-        run_scrape(args.group, args.groups)
 
 
 if __name__ == "__main__":
