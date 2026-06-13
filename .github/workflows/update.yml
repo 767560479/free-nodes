@@ -3,10 +3,14 @@ name: Auto Scrape Nodes
 on:
   schedule:
     - cron: "0 12 * * *"  # 每天 20:00（北京时间 UTC+8），即 UTC 12:00
-  workflow_dispatch:     # 允许你在 GitHub 网页上点击按钮手动运行
+  workflow_dispatch:     # 允许在 GitHub 网页上手动运行
 
 permissions:
-  contents: write        # 赋予 GitHub Actions 推送代码的权限
+  contents: write
+
+concurrency:
+  group: auto-scrape-nodes
+  cancel-in-progress: true
 
 jobs:
   build-and-update:
@@ -14,26 +18,30 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+        run: pip install -r requirements.txt
 
       - name: Run Scraper Script
-        run: |
-          python scraper.py
+        run: python scraper.py
 
       - name: Commit and Push Changes
         run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "actions-user"
-          git add output/*
-          git commit -m "自动更新节点: $(date +'%Y-%m-%d %H:%M:%S')" || exit 0
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "自动更新节点: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:master
+          fi
