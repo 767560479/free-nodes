@@ -5,6 +5,7 @@ import json
 import random
 import socket
 import time
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import quote
@@ -38,16 +39,18 @@ SOURCE_URLS = [
 BLACKLIST_KEYWORDS = ['-1', '127.0.0.1', 'timeout', 'err', '错误', '剩余', '到期', '官网', 'mibei77', '别买']
 
 # 4. 请求节奏（秒）
-REQUEST_DELAY = (2.0, 5.0)
+REQUEST_DELAY = (1.0, 2.0)
 RETRY_DELAY = (3.0, 8.0)
 MAX_RETRIES = 2
 REQUEST_TIMEOUT = 20
 
 # 5. 节点筛选
 MAX_NODES = 1000
+MAX_NODES_PER_GROUP = 300
 ENABLE_TCP_CHECK = True
 TCP_TIMEOUT = 3
 TCP_WORKERS = 64
+DEFAULT_GROUPS = 4
 
 # ====================================================
 
@@ -275,29 +278,21 @@ def rename_node(link, index):
     return link
 
 
-def main():
-    started = time.time()
-    print(f"=== 节点抓取 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+def split_source_urls(group, groups):
+    if groups <= 1:
+        return SOURCE_URLS
+    chunk = (len(SOURCE_URLS) + groups - 1) // groups
+    start = group * chunk
+    return SOURCE_URLS[start:start + chunk]
 
-    all_lines = []
-    session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
-    source_total = len(SOURCE_URLS)
 
-    for i, url in enumerate(SOURCE_URLS):
-        if i > 0:
-            _sleep(REQUEST_DELAY)
-        all_lines.extend(fetch_and_decode(url, session))
-
-    source_ok = source_total - len(_failed_sources)
-    print(f"抓取: {source_ok}/{source_total} 源成功, {len(all_lines)} 行原始数据")
-
+def dedup_nodes(lines):
     valid_nodes = []
     seen_lines = set()
     seen_fingerprints = set()
     raw_count = 0
 
-    for line in all_lines:
+    for line in lines:
         line = line.strip()
         if not line.startswith(SUPPORTED_PROTOCOLS):
             continue
@@ -317,34 +312,118 @@ def main():
             seen_fingerprints.add(fp)
         valid_nodes.append(line)
 
+    return raw_count, valid_nodes
+
+
+def write_subscription(nodes, sub_path, nodes_path=None):
+    final_nodes = [rename_node(node, i) for i, node in enumerate(nodes, 1)]
+    raw_text = "\n".join(final_nodes)
+    sub_base64 = base64.b64encode(raw_text.encode('utf-8')).decode('utf-8')
+
+    os.makedirs(os.path.dirname(sub_path) or 'output', exist_ok=True)
+    with open(sub_path, 'w', encoding='utf-8') as f:
+        f.write(sub_base64)
+    if nodes_path:
+        with open(nodes_path, 'w', encoding='utf-8') as f:
+            f.write(raw_text)
+    return len(final_nodes)
+
+
+def run_scrape(group, groups):
+    global _failed_sources
+    _failed_sources = []
+
+    started = time.time()
+    sources = split_source_urls(group, groups)
+    label = f"组 {group}/{groups - 1}" if groups > 1 else "全部"
+    max_nodes = MAX_NODES_PER_GROUP if groups > 1 else MAX_NODES
+
+    print(f"=== 节点抓取 [{label}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+
+    all_lines = []
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+
+    for i, url in enumerate(sources):
+        if i > 0:
+            _sleep(REQUEST_DELAY)
+        all_lines.extend(fetch_and_decode(url, session))
+
+    source_ok = len(sources) - len(_failed_sources)
+    print(f"抓取: {source_ok}/{len(sources)} 源成功, {len(all_lines)} 行原始数据")
+
+    raw_count, valid_nodes = dedup_nodes(all_lines)
     print(f"去重: {raw_count} -> {len(valid_nodes)} 节点")
+
+    if len(valid_nodes) > max_nodes:
+        valid_nodes = valid_nodes[:max_nodes]
+        print(f"预限: 保留前 {max_nodes} 个待检测")
 
     if ENABLE_TCP_CHECK:
         before_tcp = len(valid_nodes)
         valid_nodes = filter_alive_nodes(valid_nodes)
         print(f"TCP: {before_tcp} -> {len(valid_nodes)} 可达")
 
-    if len(valid_nodes) > MAX_NODES:
-        valid_nodes = valid_nodes[:MAX_NODES]
-        print(f"限量: 保留前 {MAX_NODES} 个")
-
-    final_nodes = [rename_node(node, i) for i, node in enumerate(valid_nodes, 1)]
-
-    raw_text = "\n".join(final_nodes)
-    sub_base64 = base64.b64encode(raw_text.encode('utf-8')).decode('utf-8')
-
-    os.makedirs('output', exist_ok=True)
-    with open('output/nodes.txt', 'w', encoding='utf-8') as f:
-        f.write(raw_text)
-    with open('output/sub.txt', 'w', encoding='utf-8') as f:
-        f.write(sub_base64)
+    sub_path = f'output/sub-{group}.txt' if groups > 1 else 'output/sub.txt'
+    nodes_path = f'output/nodes-{group}.txt' if groups > 1 else 'output/nodes.txt'
+    count = write_subscription(valid_nodes, sub_path, nodes_path)
 
     elapsed = int(time.time() - started)
-    print(f"完成: 输出 {len(final_nodes)} 节点, 耗时 {elapsed // 60}m{elapsed % 60:02d}s")
+    print(f"完成: 输出 {count} 节点 -> {sub_path}, 耗时 {elapsed // 60}m{elapsed % 60:02d}s")
 
     if _failed_sources:
         failed = ', '.join(f"{host}({err})" for host, err in _failed_sources)
         print(f"失败源 ({len(_failed_sources)}): {failed}")
+
+
+def merge_sub_files(groups):
+    started = time.time()
+    print(f"=== 合并订阅 {groups} 组 ===")
+
+    all_nodes = []
+    seen_fingerprints = set()
+
+    for i in range(groups):
+        path = f'output/sub-{i}.txt'
+        if not os.path.exists(path):
+            print(f"跳过: {path} 不存在")
+            continue
+        with open(path, encoding='utf-8') as f:
+            content = base64.b64decode(_pad_base64(f.read())).decode('utf-8')
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            fp = node_fingerprint(line)
+            if fp and fp in seen_fingerprints:
+                continue
+            if fp:
+                seen_fingerprints.add(fp)
+            base = line.split('#', 1)[0]
+            all_nodes.append(base)
+
+    print(f"合并去重: {len(all_nodes)} 节点")
+
+    if len(all_nodes) > MAX_NODES:
+        all_nodes = all_nodes[:MAX_NODES]
+        print(f"限量: 保留前 {MAX_NODES} 个")
+
+    count = write_subscription(all_nodes, 'output/sub.txt', 'output/nodes.txt')
+    elapsed = int(time.time() - started)
+    print(f"完成: sub.txt 共 {count} 节点, 耗时 {elapsed}s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='免费节点抓取与订阅生成')
+    parser.add_argument('--group', type=int, default=0, help='当前分组编号（从 0 开始）')
+    parser.add_argument('--groups', type=int, default=1, help='分组总数，1 表示不分组')
+    parser.add_argument('--merge', action='store_true', help='合并各组 sub-N.txt 为 sub.txt')
+    args = parser.parse_args()
+
+    if args.merge:
+        merge_sub_files(args.groups)
+    else:
+        run_scrape(args.group, args.groups)
 
 
 if __name__ == "__main__":
