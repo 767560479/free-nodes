@@ -33,7 +33,10 @@ SOURCE_URLS = [
     "https://raw.githubusercontent.com/hello-world-1989/cn-news/main/end-gfw-together",
 ]
 
-BLACKLIST_KEYWORDS = ['-1', '127.0.0.1', 'timeout', 'err', '错误', '剩余', '到期', '官网', 'mibei77', '别买']
+BLACKLIST_KEYWORDS = [
+    '-1', '127.0.0.1', 'timeout', 'err', '错误', '剩余', '到期', '官网', 'mibei77', '别买',
+    't.me/', 'ripaojiedian', 'subscribe', '订阅', '流量', '过期', '失效', '已过期',
+]
 
 REQUEST_DELAY = (1.0, 2.0)
 RETRY_DELAY = (3.0, 8.0)
@@ -41,10 +44,16 @@ MAX_RETRIES = 2
 REQUEST_TIMEOUT = 20
 
 TARGET_NODES = 200
-ENABLE_TCP_CHECK = True
+# GitHub Actions 在美国跑，TCP 延迟≠国内可用；端口开放≠代理能连。默认关闭 TCP 筛选。
+ENABLE_TCP_CHECK = False
 TCP_TIMEOUT = 3
 TCP_WORKERS = 128
 MAX_LATENCY_MS = 2000
+
+PROTOCOL_PRIORITY = {
+    'vmess://': 0, 'vless://': 1, 'trojan://': 2,
+    'tuic://': 3, 'hysteria2://': 4, 'ss://': 5, 'ssr://': 6,
+}
 
 # ====================================================
 
@@ -310,12 +319,34 @@ def dedup_lines(lines, seen_lines, seen_fingerprints):
     return raw_count, new_nodes
 
 
-def write_nodes_file(nodes):
+def _protocol_rank(link):
+    for prefix, rank in PROTOCOL_PRIORITY.items():
+        if link.startswith(prefix):
+            return rank
+    return 99
+
+
+def select_nodes(pool):
+    if not pool:
+        return []
+    random.shuffle(pool)
+    pool.sort(key=_protocol_rank)
+    selected = pool[:TARGET_NODES]
+    if ENABLE_TCP_CHECK:
+        selected = filter_alive_nodes(selected, TARGET_NODES)
+    return selected
+
+
+def write_output(nodes):
     final_nodes = [rename_node(node, i) for i, node in enumerate(nodes, 1)]
     raw_text = "\n".join(final_nodes)
+    sub_base64 = base64.b64encode(raw_text.encode('utf-8')).decode('utf-8')
+
     os.makedirs('output', exist_ok=True)
     with open('output/nodes.txt', 'w', encoding='utf-8') as f:
         f.write(raw_text)
+    with open('output/sub.txt', 'w', encoding='utf-8') as f:
+        f.write(sub_base64)
     return len(final_nodes)
 
 
@@ -331,12 +362,12 @@ def main():
 
     seen_lines = set()
     seen_fingerprints = set()
-    passed_nodes = []
+    node_pool = []
     total_raw = 0
     sources_used = 0
 
     for i, url in enumerate(SOURCE_URLS):
-        if len(passed_nodes) >= TARGET_NODES:
+        if len(node_pool) >= TARGET_NODES:
             break
 
         if i > 0:
@@ -346,26 +377,25 @@ def main():
         sources_used += 1
         raw_count, candidates = dedup_lines(lines, seen_lines, seen_fingerprints)
         total_raw += raw_count
+        node_pool.extend(candidates)
 
-        if not candidates:
-            continue
-
-        need = TARGET_NODES - len(passed_nodes)
-        passed = filter_alive_nodes(candidates, need)
-        passed_nodes.extend(passed)
-
-        if len(passed_nodes) >= TARGET_NODES:
-            print(f"已达 {TARGET_NODES} 个可用节点，停止抓取与检测")
+        if len(node_pool) >= TARGET_NODES:
+            print(f"已收集 {len(node_pool)} 个去重节点，停止抓取")
             break
 
     print(f"抓取: {sources_used}/{len(SOURCE_URLS)} 源, {total_raw} 行原始数据")
-    print(f"TCP: {len(passed_nodes)} 节点通过 (≤{MAX_LATENCY_MS}ms, {TCP_WORKERS} 线程)")
+    print(f"去重池: {len(node_pool)} 节点")
 
-    if not passed_nodes:
+    selected = select_nodes(node_pool)
+    if ENABLE_TCP_CHECK:
+        print(f"TCP: {len(selected)} 节点通过 (≤{MAX_LATENCY_MS}ms)")
+
+    if not selected:
         print("无可用节点，跳过写入")
     else:
-        count = write_nodes_file(passed_nodes)
-        print(f"完成: 写入 output/nodes.txt ({count} 节点)")
+        count = write_output(selected)
+        print(f"完成: 写入 nodes.txt + sub.txt ({count} 节点)")
+        print("订阅请用 sub.txt（Base64），不要用 nodes.txt 当订阅链接")
 
     elapsed = int(time.time() - started)
     print(f"耗时 {elapsed // 60}m{elapsed % 60:02d}s")
