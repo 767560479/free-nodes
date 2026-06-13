@@ -49,7 +49,8 @@ MAX_NODES = 1000
 MAX_NODES_PER_GROUP = 300
 ENABLE_TCP_CHECK = True
 TCP_TIMEOUT = 3
-TCP_WORKERS = 64
+TCP_WORKERS = 128
+MAX_LATENCY_MS = 2000   # TCP 握手超过此毫秒数则不写入
 DEFAULT_GROUPS = 4
 
 # ====================================================
@@ -195,18 +196,19 @@ def node_fingerprint(link):
     return None
 
 
-def tcp_alive(host, port):
+def tcp_connect_latency_ms(host, port):
     try:
         port_num = int(port)
     except (TypeError, ValueError):
-        return False
+        return None
     if not host or port_num <= 0 or port_num > 65535:
-        return False
+        return None
+    start = time.perf_counter()
     try:
         with socket.create_connection((host, port_num), timeout=TCP_TIMEOUT):
-            return True
+            return (time.perf_counter() - start) * 1000
     except OSError:
-        return False
+        return None
 
 
 def filter_alive_nodes(nodes):
@@ -219,13 +221,13 @@ def filter_alive_nodes(nodes):
         for node in nodes:
             fp = node_fingerprint(node)
             if not fp:
-                alive.append(node)
                 continue
             host, port, _ = fp
-            futures[executor.submit(tcp_alive, host, port)] = node
+            futures[executor.submit(tcp_connect_latency_ms, host, port)] = node
 
         for future in as_completed(futures):
-            if future.result():
+            latency_ms = future.result()
+            if latency_ms is not None and latency_ms <= MAX_LATENCY_MS:
                 alive.append(futures[future])
     return alive
 
@@ -362,7 +364,7 @@ def run_scrape(group, groups):
     if ENABLE_TCP_CHECK:
         before_tcp = len(valid_nodes)
         valid_nodes = filter_alive_nodes(valid_nodes)
-        print(f"TCP: {before_tcp} -> {len(valid_nodes)} 可达")
+        print(f"TCP: {before_tcp} -> {len(valid_nodes)} 可达 (≤{MAX_LATENCY_MS}ms, {TCP_WORKERS} 线程)")
 
     sub_path = f'output/sub-{group}.txt' if groups > 1 else 'output/sub.txt'
     nodes_path = f'output/nodes-{group}.txt' if groups > 1 else 'output/nodes.txt'
